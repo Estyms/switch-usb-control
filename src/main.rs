@@ -42,8 +42,8 @@ enum Connection {
     INTERNET(TcpStream),
 }
 
-#[derive(Eq, PartialEq)]
-#[derive(Hash, Debug, Copy, Clone)]
+#[derive(Eq, PartialEq, Clone, Copy)]
+#[derive(Hash, Debug)]
 enum Button {
     A,
     B,
@@ -77,7 +77,7 @@ enum ButtonState {
     RELEASED,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ControllerState {
     button_states: HashMap<Button, ButtonState>,
     r_stick: (i32, i32),
@@ -122,8 +122,13 @@ impl ControllerState {
         }
     }
 
+    fn get_old_state(&self) -> HashMap<Button, ButtonState> {
+        let x = &self.old_state;
+        x.clone().unwrap_or_default()
+    }
+
     fn set_button_states(&mut self, (new_button, new_state): (Button, ButtonState)) -> (Button, ButtonState) {
-        let binding = self.clone().old_state.unwrap_or_default();
+        let binding = self.get_old_state();
         let old_button_state = binding.get(&new_button);
         if let Some(reference) = self.button_states.get_mut(&new_button) {
             match *reference {
@@ -274,14 +279,15 @@ fn build_packets(data: Vec<String>) -> Vec<Vec<u8>> {
 }
 fn write_packet(interface: &Interface, data: Vec<Vec<u8>>) {
     let mut queue = interface.bulk_out_queue(0x1);
-    data.iter().for_each(|x| queue.submit(x.clone()));
-    for _ in 0..data.len() {
+    let data_len = data.len();
+    data.into_iter().for_each(|x| queue.submit(x));
+    for _ in 0..data_len {
         let _ = block_on(queue.next_complete());
     }
 }
 
 fn process_button_action(controller_state: &mut ControllerState, btn: &gilrs::Button, state: ButtonState) {
-    if let Some(switch_key) = BTN_ASSOCIATION.get_rev(&btn) {
+    if let Some(switch_key) = BTN_ASSOCIATION.get_rev(btn) {
         controller_state.set_button_states((*switch_key, state));
     }
 }
@@ -392,7 +398,7 @@ fn main() {
         }
 
         //Crappy but oh well
-        controller_state.old_state = Some(controller_state.button_states.clone());
+        controller_state.old_state = Some(controller_state.button_states);
         controller_state.old_l_stick = controller_state.l_stick;
         controller_state.old_r_stick = controller_state.r_stick;
         controller_state.button_states = HashMap::new();
