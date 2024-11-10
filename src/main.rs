@@ -5,6 +5,8 @@ use gilrs::{ev, Axis, Event, EventType, Gilrs};
 use lazy_static::lazy_static;
 use nusb::{Device, DeviceInfo, Interface};
 use std::collections::HashMap;
+use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, SystemTime};
 
 lazy_static! {
@@ -30,6 +32,16 @@ lazy_static! {
     ]));
 }
 
+enum ConnectionType {
+    USB,
+    INTERNET,
+}
+
+enum Connection {
+    USB(Interface),
+    INTERNET(TcpStream),
+}
+
 #[derive(Eq, PartialEq)]
 #[derive(Hash, Debug, Copy, Clone)]
 enum Button {
@@ -50,14 +62,19 @@ enum Button {
     START,
     SELECT,
     CAPTURE,
-    HOME
+    HOME,
+}
+
+enum Stick {
+    RIGHT,
+    LEFT
 }
 
 #[derive(Debug, Copy, Clone)]
 enum ButtonState {
     PRESSED,
     HELD,
-    RELEASED
+    RELEASED,
 }
 
 #[derive(Debug, Clone)]
@@ -98,37 +115,37 @@ impl ControllerState {
         ControllerState {
             r_stick: (0, 0),
             l_stick: (0, 0),
-            old_l_stick: (0,0),
+            old_l_stick: (0, 0),
             old_r_stick: (0, 0),
             button_states: HashMap::new(),
-            old_state: None
+            old_state: None,
         }
     }
 
-    fn set_button_states(&mut self, (new_button, new_state): (Button, ButtonState)) {
+    fn set_button_states(&mut self, (new_button, new_state): (Button, ButtonState)) -> (Button, ButtonState) {
         let binding = self.clone().old_state.unwrap_or_default();
         let old_button_state = binding.get(&new_button);
         if let Some(reference) = self.button_states.get_mut(&new_button) {
             match *reference {
                 ButtonState::PRESSED => {
                     match new_state {
-                        ButtonState::PRESSED => {}
-                        ButtonState::HELD => {}
-                        ButtonState::RELEASED => {}
+                        ButtonState::PRESSED => {(new_button, *reference)},
+                        ButtonState::HELD => {(new_button, *reference)}
+                        ButtonState::RELEASED => {(new_button, *reference)}
                     }
                 }
                 ButtonState::HELD => {
                     match new_state {
-                        ButtonState::PRESSED => { *reference = ButtonState::PRESSED }
-                        ButtonState::HELD => {}
-                        ButtonState::RELEASED => { *reference = ButtonState::PRESSED}
+                        ButtonState::PRESSED => { *reference = ButtonState::PRESSED; (new_button, *reference)}
+                        ButtonState::HELD => {(new_button, *reference)}
+                        ButtonState::RELEASED => { *reference = ButtonState::PRESSED; (new_button, *reference)}
                     }
                 }
                 ButtonState::RELEASED => {
                     match new_state {
-                        ButtonState::PRESSED => { *reference = ButtonState::HELD }
-                        ButtonState::HELD => { *reference = ButtonState::HELD }
-                        ButtonState::RELEASED => {  }
+                        ButtonState::PRESSED => { *reference = ButtonState::HELD; (new_button, *reference) }
+                        ButtonState::HELD => { *reference = ButtonState::HELD; (new_button, *reference) }
+                        ButtonState::RELEASED => {(new_button, *reference)}
                     }
                 }
             }
@@ -136,71 +153,82 @@ impl ControllerState {
             match *old_state {
                 ButtonState::PRESSED => {
                     match new_state {
-                        ButtonState::PRESSED => { self.button_states.insert(new_button, ButtonState::PRESSED); }
-                        ButtonState::HELD => { self.button_states.insert(new_button, ButtonState::HELD); }
-                        ButtonState::RELEASED => { self.button_states.insert(new_button, ButtonState::RELEASED); }
+                        ButtonState::PRESSED => { self.button_states.insert(new_button, ButtonState::PRESSED); (new_button, ButtonState::PRESSED)}
+                        ButtonState::HELD => { self.button_states.insert(new_button, ButtonState::HELD); (new_button, ButtonState::HELD)}
+                        ButtonState::RELEASED => { self.button_states.insert(new_button, ButtonState::RELEASED); (new_button, ButtonState::RELEASED)}
                     }
                 }
                 ButtonState::HELD => {
                     match new_state {
-                        ButtonState::PRESSED => { self.button_states.insert(new_button, ButtonState::PRESSED); }
-                        ButtonState::HELD => {  }
+                        ButtonState::PRESSED => { self.button_states.insert(new_button, ButtonState::PRESSED); (new_button, ButtonState::PRESSED)}
+                        ButtonState::HELD => {(new_button, ButtonState::HELD)}
                         ButtonState::RELEASED => {
                             self.button_states.insert(new_button, ButtonState::RELEASED);
+                            (new_button, ButtonState::RELEASED)
                         }
                     }
                 }
                 ButtonState::RELEASED => {
                     match new_state {
-                        ButtonState::PRESSED => { self.button_states.insert(new_button, ButtonState::PRESSED); }
-                        ButtonState::HELD => { self.button_states.insert(new_button, ButtonState::HELD); }
-                        ButtonState::RELEASED => {}
+                        ButtonState::PRESSED => { self.button_states.insert(new_button, ButtonState::PRESSED); (new_button, ButtonState::PRESSED)}
+                        ButtonState::HELD => { self.button_states.insert(new_button, ButtonState::HELD); (new_button, ButtonState::HELD)}
+                        ButtonState::RELEASED => {(new_button, ButtonState::RELEASED)}
                     }
                 }
             }
         } else {
             self.button_states.insert(new_button, new_state);
+            (new_button, new_state)
         }
     }
 
-    fn make_packets(self) -> Vec<String> {
-        let mut packets: Vec<_> = self.button_states.iter().map(|(button, state)| {
-            match state {
-                ButtonState::PRESSED => {
-                    format!("click {}", get_button_name(*button))
-                }
-                ButtonState::HELD => {
-                    format!("press {}", get_button_name(*button))
-                }
-                ButtonState::RELEASED => {
-                    format!("release {}", get_button_name(*button))
-                }
-            }
-        }).collect();
+
+    fn make_packets(&self) -> Vec<String> {
+        let mut packets: Vec<_> = self.button_states.iter().map(|(button, state)| make_packet_for_button_state(*button, *state)).collect();
 
         if self.old_r_stick != self.r_stick {
-            packets.push(format!("setStick RIGHT {} {}", to_hex_string(self.r_stick.0), to_hex_string(self.r_stick.1)));
+            packets.push(make_packet_for_stick(Stick::RIGHT, self.r_stick))
         }
 
         if self.old_l_stick != self.l_stick {
-            packets.push(format!("setStick LEFT {} {}", to_hex_string(self.l_stick.0), to_hex_string(self.l_stick.1)));
+            packets.push(make_packet_for_stick(Stick::LEFT, self.l_stick))
         }
 
         packets
     }
 }
 
+fn make_packet_for_stick(stick: Stick, value: (i32, i32)) -> String {
+    match stick {
+        Stick::RIGHT => format!("setStick RIGHT {} {}", to_hex_string(value.0), to_hex_string(value.1)),
+        Stick::LEFT => format!("setStick LEFT {} {}", to_hex_string(value.0), to_hex_string(value.1))
+    }
+}
+
+fn make_packet_for_button_state(button: Button, state: ButtonState) -> String {
+    match state {
+        ButtonState::PRESSED => {
+            format!("click {}", get_button_name(button))
+        }
+        ButtonState::HELD => {
+            format!("press {}", get_button_name(button))
+        }
+        ButtonState::RELEASED => {
+            format!("release {}", get_button_name(button))
+        }
+    }
+}
+
+
 fn to_hex_string(n: i32) -> String {
-    // Check if the number is in the range of a 16-bit signed integer
     if !(-0x8000..=0x7FFF).contains(&n) {
         panic!("Number out of range for 16-bit signed integer");
     }
 
-    // Format the number as a hexadecimal string
     if n < 0 {
-        format!("-0x{:>04X}", -n) // For negative numbers
+        format!("-0x{:>04X}", -n)
     } else {
-        format!("0x{:>04X}", n) // For non-negative numbers
+        format!("0x{:>04X}", n)
     }
 }
 
@@ -252,27 +280,64 @@ fn write_packet(interface: &Interface, data: Vec<Vec<u8>>) {
     }
 }
 
+fn process_button_action(controller_state: &mut ControllerState, btn: &gilrs::Button, state: ButtonState) {
+    if let Some(switch_key) = BTN_ASSOCIATION.get_rev(&btn) {
+        controller_state.set_button_states((*switch_key, state));
+    }
+}
+
+fn input_ip_address() -> SocketAddr {
+    let ip = inquire::Text::new("Enter the IP Address of the switch")
+        .prompt()
+        .expect("Invalid IP");
+
+    let port = inquire::Text::new("Enter the port of the switch")
+        .prompt()
+        .expect("Invalid Port");
+
+    SocketAddr::from((ip.as_str().parse::<Ipv4Addr>().expect("Invalid IP"), port.parse::<u16>().expect("Invalid port number")))
+}
+
 fn main() {
+    let ans = inquire::Select::new("What kind of connection do you want?", vec!["Internet", "USB"]).prompt().expect("No connection type selected");
 
+    let connection_type = match ans {
+        "Internet" => ConnectionType::INTERNET,
+        "USB" => ConnectionType::USB,
+        _ => panic!("Unknown connection type!")
+    };
 
+    let mut connection = match connection_type {
+        ConnectionType::USB => {
+            let device_info = get_switch_device_info();
+            let device = get_device(device_info);
+            device.reset().expect("cannot reset");
+            Connection::USB(device.claim_interface(0).unwrap())
+        }
+        ConnectionType::INTERNET => {
+            Connection::INTERNET(TcpStream::connect(input_ip_address()).expect("Cannot connect to switch"))
+        }
+    };
 
+    println!("Successfully connected to switch device!");
+
+    println!("Please connect and press a button on your controller");
     let mut gilrs = Gilrs::new().unwrap();
     let mut active_gamepad = None;
     let mut exit = false;
     let mut controller_state = ControllerState::new();
-    let mut interface = None;
     while !exit {
         let a = SystemTime::now();
-        let wait_for = Duration::from_millis(30);
+        let wait_for: Duration = match connection_type {
+            ConnectionType::USB => Duration::from_millis(66),
+            ConnectionType::INTERNET => Duration::from_millis(100)
+        };
 
         while SystemTime::now().duration_since(a).unwrap_or(Duration::from_millis(0)).lt(&wait_for) {
             while let Some(Event { id, event, .. }) = gilrs.next_event() {
                 if active_gamepad.is_none() {
                     active_gamepad = Some(id);
-                    let device_info = get_switch_device_info();
-                    let device = get_device(device_info);
-                    device.reset().expect("cannot reset");
-                    interface = Some(device.claim_interface(0).unwrap());
+                    println!("Controller connected !");
                 } else if active_gamepad.unwrap() != id {
                     continue
                 }
@@ -285,25 +350,20 @@ fn main() {
                     e => {
                         match e {
                             EventType::ButtonPressed(btn, _) => {
-                                if let Some(switch_key) = BTN_ASSOCIATION.get_rev(&btn) {
-                                    controller_state.set_button_states((*switch_key, ButtonState::HELD));
-                                }
+                                process_button_action(&mut controller_state, &btn, ButtonState::HELD);
                             }
                             EventType::ButtonReleased(btn, _) => {
-                                if let Some(switch_key) = BTN_ASSOCIATION.get_rev(&btn) {
-                                    controller_state.set_button_states((*switch_key, ButtonState::RELEASED));
-                                }
+                                process_button_action(&mut controller_state, &btn, ButtonState::RELEASED);
                             }
                             EventType::AxisChanged(axis, value, _) => {
                                 match axis {
-                                    Axis::LeftStickX => { controller_state.l_stick.0 = get_axis_values(value) }
+                                    Axis::LeftStickX => { controller_state.l_stick.0 = get_axis_values(value)}
                                     Axis::LeftStickY => { controller_state.l_stick.1 = get_axis_values(value) }
-                                    Axis::RightStickX => { controller_state.r_stick.0 = get_axis_values(value) }
-                                    Axis::RightStickY => { controller_state.r_stick.1 = get_axis_values(value) }
-                                    _ => {}
+                                    Axis::RightStickX => { controller_state.r_stick.0 = get_axis_values(value)}
+                                    Axis::RightStickY => { controller_state.r_stick.1 = get_axis_values(value)}
+                                    _ => { }
                                 }
                             }
-                            EventType::ForceFeedbackEffectCompleted => {}
                             _ => {}
                         }
                     }
@@ -312,20 +372,33 @@ fn main() {
         }
 
         if !exit && active_gamepad.is_some() {
-            let packet_strings = controller_state.clone().make_packets();
+            use Connection::*;
+            let packet_strings = controller_state.make_packets();
             if !packet_strings.is_empty() {
-                let packets = build_packets(packet_strings);
-                if let Some(ref i_face) = interface {
-                    write_packet(i_face, packets);
+                match connection {
+                    USB(ref interface) => {
+                        let packets = build_packets(packet_strings);
+                        write_packet(interface, packets);
+                    }
+                    INTERNET(ref mut socket) => {
+                        packet_strings.iter()
+                            .map(|s| format!("{}\r\n", s))
+                            .for_each(|p| {
+                                socket.write_all(p.as_bytes()).expect("Unable to send packet");
+                            });
+                    }
                 }
             }
         }
+
+        //Crappy but oh well
         controller_state.old_state = Some(controller_state.button_states.clone());
         controller_state.old_l_stick = controller_state.l_stick;
         controller_state.old_r_stick = controller_state.r_stick;
         controller_state.button_states = HashMap::new();
     }
-
 }
+
+
 
 
